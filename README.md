@@ -62,8 +62,16 @@ python3 -m python_flattener build \
 - Extracts embedded `app/` + `deps/` to a cache directory:
   - default: `tempfile.gettempdir()/python_flattener_cache/<sha256>`
   - override with: `PYTHON_FLATTENER_CACHE_DIR=/some/path`
-- Adds `app/` then `deps/` to `sys.path`
-- Runs the entrypoint
+- Adds `app/` then `deps/` to `sys.path` (and processes `.pth` files in `deps/`)
+- When executed (`python bundle.py`): runs the entrypoint
+- When imported (`import bundle`): loads the original module/package into the bundle module so its symbols are available transparently
+
+## Importing Bundles
+
+If you want other code to be able to `import` the flattened output *without changing imports*:
+
+- For a module `foo.py`, write output to `foo.py`.
+- For a package directory `foo/`, write output to `foo.py` (the bundle makes itself behave like a package so `import foo.bar` still works).
 
 ## Notes / Limitations
 

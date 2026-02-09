@@ -603,6 +603,7 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
 
     import base64
     import hashlib
+    import importlib.util
     import io
     import os
     import pathlib
@@ -794,6 +795,25 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
         return root
 
 
+    def _configure_sys_path(*, app_dir: pathlib.Path, deps_dir: pathlib.Path) -> None:
+        """Configure ``sys.path`` so app + bundled deps are importable.
+
+        :param app_dir: Extracted ``app/`` directory.
+        :param deps_dir: Extracted ``deps/`` directory.
+        """
+
+        app_str: str = str(app_dir)
+        if app_str in sys.path:
+            sys.path.remove(app_str)
+        sys.path.insert(0, app_str)
+
+        deps_str: str = str(deps_dir)
+        site.addsitedir(deps_str)
+        if deps_str in sys.path:
+            sys.path.remove(deps_str)
+        sys.path.insert(1, deps_str)
+
+
     def _run(entry_root: pathlib.Path) -> None:
         """Execute the app entrypoint.
 
@@ -802,12 +822,7 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
 
         app_dir: pathlib.Path = entry_root / "app"
         deps_dir: pathlib.Path = entry_root / "deps"
-        sys.path.insert(0, str(app_dir))
-        site.addsitedir(str(deps_dir))
-        deps_str: str = str(deps_dir)
-        if deps_str in sys.path:
-            sys.path.remove(deps_str)
-        sys.path.insert(1, deps_str)
+        _configure_sys_path(app_dir=app_dir, deps_dir=deps_dir)
 
         kind: str = _ENTRY["kind"]
         if kind == "module":
@@ -826,6 +841,136 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
         _runtime_error(f"Invalid entry kind: {kind!r}\n")
 
 
+    def _try_resolve_module_source(
+        *, app_dir: pathlib.Path, module_name: str
+    ) -> tuple[pathlib.Path, bool, pathlib.Path | None] | None:
+        """Resolve a module name into a source file within the extracted app dir.
+
+        :param app_dir: Extracted ``app/`` directory.
+        :param module_name: Dotted module name.
+        :returns: ``(source_path, is_package, package_dir)`` or ``None``.
+        """
+
+        parts: list[str] = module_name.split(".")
+        pkg_dir: pathlib.Path = app_dir.joinpath(*parts)
+        init_py: pathlib.Path = pkg_dir / "__init__.py"
+        if init_py.is_file() is True:
+            return (init_py, True, pkg_dir)
+
+        mod_py: pathlib.Path = app_dir.joinpath(*parts).with_suffix(".py")
+        if mod_py.is_file() is True:
+            return (mod_py, False, None)
+
+        return None
+
+
+    def _resolve_import_source(*, app_dir: pathlib.Path) -> tuple[pathlib.Path, bool, pathlib.Path | None]:
+        """Pick a source file to load into this module when imported.
+
+        The preferred behavior is "transparent import": if the bundle file is named
+        the same as the original module/package, ``import <name>`` should behave
+        like importing the original module/package.
+
+        :param app_dir: Extracted ``app/`` directory.
+        :returns: ``(source_path, is_package, package_dir)``.
+        """
+
+        resolved_self = _try_resolve_module_source(app_dir=app_dir, module_name=__name__)
+        if resolved_self is not None:
+            return resolved_self
+
+        kind: str = _ENTRY["kind"]
+        if kind == "path":
+            rel_path: str = _ENTRY["path"]
+            entry_path: pathlib.Path = app_dir / rel_path
+            if entry_path.is_file() is False:
+                _runtime_error(f"Entry file missing after extraction: {rel_path!r}\n")
+            return (entry_path, False, None)
+
+        if kind == "module":
+            module_name: str = _ENTRY["module"]
+            resolved_entry = _try_resolve_module_source(
+                app_dir=app_dir,
+                module_name=module_name,
+            )
+            if resolved_entry is None:
+                _runtime_error("Entry module missing after extraction.\n" f"module={module_name!r}\n")
+            return resolved_entry
+
+        _runtime_error(f"Invalid entry kind: {kind!r}\n")
+        raise AssertionError("unreachable")
+
+
+    def _exec_app_into_this_module(
+        *,
+        source_path: pathlib.Path,
+        is_package: bool,
+        package_dir: pathlib.Path | None,
+    ) -> None:
+        """Execute the extracted app module/package code into this module.
+
+        :param source_path: Path to the extracted module source file.
+        :param is_package: Whether this should behave like a package.
+        :param package_dir: Package directory (required when ``is_package`` is true).
+        """
+
+        submodule_locations: list[str] | None = None
+        if is_package is True:
+            if package_dir is None:
+                _runtime_error("Internal error: is_package true but package_dir missing.\n")
+            submodule_locations = [str(package_dir)]
+
+        spec = importlib.util.spec_from_file_location(
+            __name__,
+            str(source_path),
+            submodule_search_locations=submodule_locations,
+        )
+        if spec is None or spec.loader is None:
+            _runtime_error("Failed to create an import spec for extracted sources.\n")
+
+        m = sys.modules[__name__]
+        m.__spec__ = spec
+        m.__loader__ = spec.loader
+        m.__file__ = str(source_path)
+        if is_package is True:
+            if package_dir is None:
+                _runtime_error("Internal error: package_dir missing.\n")
+            m.__path__ = [str(package_dir)]
+            m.__package__ = __name__
+        else:
+            m.__package__ = __name__.rpartition(".")[0]
+
+        spec.loader.exec_module(m)
+
+
+    _BOOTSTRAPPED_IMPORT: bool = False
+
+
+    def _bootstrap_import() -> None:
+        """Make importing the bundle behave like importing the original module/package."""
+
+        global _BOOTSTRAPPED_IMPORT
+        if _BOOTSTRAPPED_IMPORT is True:
+            return
+        _BOOTSTRAPPED_IMPORT = True
+
+        _check_runtime_compat()
+        root: pathlib.Path = _ensure_extracted()
+        app_dir: pathlib.Path = root / "app"
+        deps_dir: pathlib.Path = root / "deps"
+        _configure_sys_path(app_dir=app_dir, deps_dir=deps_dir)
+
+        source_path: pathlib.Path
+        is_package: bool
+        package_dir: pathlib.Path | None
+        source_path, is_package, package_dir = _resolve_import_source(app_dir=app_dir)
+        _exec_app_into_this_module(
+            source_path=source_path,
+            is_package=is_package,
+            package_dir=package_dir,
+        )
+
+
     def main() -> None:
         """Program entrypoint."""
 
@@ -836,5 +981,7 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
 
     if __name__ == "__main__":
         main()
+    else:
+        _bootstrap_import()
     '''
 ).lstrip()
