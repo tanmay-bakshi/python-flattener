@@ -8,6 +8,21 @@ Builds a **single** self-extracting Python file (one massive `.py`) from:
 
 The generated bundle is runnable on a fresh Python install on the target machine (it will extract embedded files to a cache directory at runtime; no `pip install` required).
 
+## Install
+
+Editable install for development:
+
+```bash
+python3 -m pip install -e .
+```
+
+Then use either:
+
+```bash
+python-flattener --help
+python3 -m python_flattener --help
+```
+
 ## Usage
 
 ```bash
@@ -54,4 +69,3 @@ python3 -m python_flattener build \
 
 - Cross-platform builds require **wheels** for the target (pip is invoked with `--only-binary=:all:` when constraints are set).
 - Some binary wheels rely on OS-level shared libraries; a “fresh Python install” on the target OS still needs those OS libraries present.
-

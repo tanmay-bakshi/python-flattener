@@ -1,0 +1,41 @@
+[build-system]
+requires = [
+  "setuptools>=69",
+  "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "python-flattener"
+version = "0.1.0"
+description = "Bundle a Python app and its dependencies into a single self-extracting .py file."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "UNLICENSED" }
+keywords = ["bundler", "single-file", "zipapp", "packaging", "pip", "wheels"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: Other/Proprietary License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development :: Build Tools",
+  "Topic :: System :: Software Distribution",
+]
+dependencies = []
+
+[project.scripts]
+python-flattener = "python_flattener.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["python_flattener*"]
+
+[tool.setuptools.package-data]
+python_flattener = ["py.typed"]
