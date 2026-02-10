@@ -128,6 +128,14 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_build.add_argument(
+        "--in-memory-runtime",
+        action="store_true",
+        help=(
+            "Prefer an in-memory runtime that avoids filesystem extraction (Linux only). "
+            "This is useful for containers with read-only filesystems."
+        ),
+    )
+    p_build.add_argument(
         "-v",
         "--verbose",
         action="count",
@@ -161,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
             entry_relpath=ns.entry,
             entry_module=ns.module,
             logger=logger,
+            prefer_in_memory_runtime=ns.in_memory_runtime,
         )
         return 0
 

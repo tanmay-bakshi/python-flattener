@@ -343,6 +343,7 @@ def build_single_file(
     entry_relpath: str | None,
     entry_module: str | None,
     logger: logging.Logger | None = None,
+    prefer_in_memory_runtime: bool = False,
     cache_dir: pathlib.Path | None = None,
     compresslevel: int = 1,
 ) -> None:
@@ -355,6 +356,7 @@ def build_single_file(
     :param entry_relpath: Optional entry file path relative to the input directory.
     :param entry_module: Optional module name to run (python -m style).
     :param logger: Optional logger for realtime build progress output.
+    :param prefer_in_memory_runtime: Prefer an in-memory runtime in the generated script.
     :raises BuildError: If bundling fails.
     """
 
@@ -446,6 +448,7 @@ def build_single_file(
             entry=app_layout.entry,
             target=target,
             logger=logger,
+            prefer_in_memory_runtime=prefer_in_memory_runtime,
         )
         t_write1: float = time.perf_counter()
         out_size: int = output_path.stat().st_size
@@ -995,6 +998,7 @@ def _write_single_file(
     entry: EntryPoint,
     target: TargetConfig,
     logger: logging.Logger,
+    prefer_in_memory_runtime: bool,
 ) -> None:
     """Write the final self-extracting bundle script to disk.
 
@@ -1005,6 +1009,7 @@ def _write_single_file(
     :param entry: Entrypoint information.
     :param target: Target config embedded for runtime validation.
     :param logger: Logger for progress output.
+    :param prefer_in_memory_runtime: Prefer an in-memory runtime in the generated script.
     :raises BuildError: If the runtime template placeholders are missing.
     """
 
@@ -1034,6 +1039,8 @@ def _write_single_file(
     runtime = runtime.replace("__PYFLAT_SHA256__", sha256)
     runtime = runtime.replace("__PYFLAT_TARGET_JSON__", target_json)
     runtime = runtime.replace("__PYFLAT_ENTRY_JSON__", entry_json)
+    prefer_text: str = "True" if prefer_in_memory_runtime is True else "False"
+    runtime = runtime.replace("__PYFLAT_PREFER_IN_MEMORY__", prefer_text)
 
     marker: str = "__PYFLAT_BUNDLE_B64__"
     idx: int = runtime.find(marker)
@@ -1117,7 +1124,13 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
     # Target config is embedded below in _TARGET / _ENTRY.
 
     import base64
+    import builtins
+    import ctypes
+    from dataclasses import dataclass
     import hashlib
+    import importlib.abc
+    import importlib.machinery
+    import importlib.resources
     import importlib.util
     import io
     import os
@@ -1126,6 +1139,7 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
     import runpy
     import shutil
     import site
+    import struct
     import sys
     import tempfile
     import zipfile
@@ -1134,8 +1148,20 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
     _BUNDLE_SHA256: str = "__PYFLAT_SHA256__"
     _TARGET: dict[str, str] = __PYFLAT_TARGET_JSON__
     _ENTRY: dict[str, str] = __PYFLAT_ENTRY_JSON__
+    _PREFER_IN_MEMORY: bool = __PYFLAT_PREFER_IN_MEMORY__
 
     _BUNDLE_B64: str = r"""__PYFLAT_BUNDLE_B64__"""
+
+    _MEM_SETUP_DONE: bool = False
+    _MEM_FDS: list[int] = []
+    _MEM_LIB_HANDLES: list[ctypes.CDLL] = []
+    _MEM_PAYLOAD_ZIP_PATH: str | None = None
+    _MEM_DEPS_ZIP_PATH: str | None = None
+    _MEM_EXTENSION_MODULE_PATHS: dict[str, str] = {}
+    _OPEN_PATCHED: bool = False
+    _ORIG_OPEN = builtins.open
+    _RESOURCES_PATCHED: bool = False
+    _ORIG_IMPORTLIB_AS_FILE = importlib.resources.as_file
 
 
     def _runtime_error(message: str) -> None:
@@ -1148,6 +1174,1088 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
         if message.endswith("\n") is False:
             sys.stderr.write("\n")
         raise SystemExit(2)
+
+
+    def _parse_env_bool(value: str) -> bool | None:
+        """Parse a string into a boolean.
+
+        :param value: Raw environment variable string.
+        :returns: Parsed boolean, or ``None`` if unknown.
+        """
+
+        v: str = value.strip().lower()
+        if v in {"1", "true", "yes", "on"}:
+            return True
+        if v in {"0", "false", "no", "off"}:
+            return False
+        return None
+
+
+    def _use_in_memory_runtime() -> bool:
+        """Return whether the in-memory runtime mode should be used.
+
+        This can be overridden via ``PYTHON_FLATTENER_IN_MEMORY``.
+
+        :returns: ``True`` if in-memory mode should be enabled.
+        """
+
+        override: str | None = os.environ.get("PYTHON_FLATTENER_IN_MEMORY")
+        if override is not None and len(override) > 0:
+            parsed: bool | None = _parse_env_bool(override)
+            if parsed is not None:
+                return parsed
+
+        return _PREFER_IN_MEMORY
+
+
+    def _bundle_zip_bytes() -> bytes:
+        """Decode and validate the embedded bundle payload.
+
+        :returns: Bundle zip bytes.
+        """
+
+        zip_bytes: bytes = base64.b64decode(_BUNDLE_B64.encode("ascii"))
+        digest: str = hashlib.sha256(zip_bytes).hexdigest()
+        if digest != _BUNDLE_SHA256:
+            _runtime_error("Bundle payload checksum mismatch (corrupt file).\n")
+        return zip_bytes
+
+
+    def _proc_fd_path(fd: int) -> str:
+        """Build a ``/proc`` path for a file descriptor.
+
+        :param fd: File descriptor number.
+        :returns: Path like ``/proc/self/fd/<fd>``.
+        """
+
+        return f"/proc/self/fd/{fd}"
+
+
+    def _memfd_from_bytes(*, name: str, data: bytes) -> int:
+        """Create a Linux memfd containing the given bytes.
+
+        :param name: memfd name (debug-only).
+        :param data: Data to write.
+        :returns: File descriptor number.
+        """
+
+        if hasattr(os, "memfd_create") is False:
+            _runtime_error("In-memory mode requires Linux with os.memfd_create().\n")
+
+        flags: int = 0
+        if hasattr(os, "MFD_CLOEXEC") is True:
+            flags = os.MFD_CLOEXEC
+
+        fd: int = os.memfd_create(name, flags=flags)
+        os.set_inheritable(fd, False)
+        _MEM_FDS.append(fd)
+
+        view = memoryview(data)
+        off: int = 0
+        total: int = len(view)
+        while off < total:
+            n_written: int = os.write(fd, view[off:])
+            if n_written <= 0:
+                _runtime_error("Failed to write bundle bytes into memfd.\n")
+            off += n_written
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        return fd
+
+
+    @dataclass(frozen=True, slots=True)
+    class _SoInfo:
+        """Shared object metadata for the in-memory runtime.
+
+        :ivar member: Zip member name within the deps layer zip.
+        :ivar fd_path: ``/proc/self/fd/<fd>`` path for the memfd holding this object.
+        :ivar soname: Library SONAME (or basename fallback).
+        :ivar needed: DT_NEEDED dependency names.
+        :ivar module_name: Dotted module name if this is a Python extension module.
+        """
+
+        member: str
+        fd_path: str
+        soname: str
+        needed: tuple[str, ...]
+        module_name: str | None
+
+
+    def _is_shared_object_member(member: str) -> bool:
+        """Check whether a zip member name looks like a shared object.
+
+        :param member: Zip member name.
+        :returns: ``True`` if it looks like a shared object file.
+        """
+
+        name: str = member.lower()
+        if name.endswith(".so") is True:
+            return True
+        if ".so." in name:
+            return True
+        return False
+
+
+    def _extension_module_name_from_member(member: str) -> str | None:
+        """Convert a deps-layer zip member into an extension module name.
+
+        This only returns a name when all path segments are valid Python identifiers.
+
+        :param member: Zip member name (POSIX path).
+        :returns: Dotted module name, or ``None``.
+        """
+
+        parts: list[str] = member.split("/")
+        if len(parts) == 0:
+            return None
+
+        filename: str = parts[-1]
+        base: str = filename.split(".", 1)[0]
+        if base == "__init__":
+            return None
+        if base.isidentifier() is False:
+            return None
+
+        dir_parts: list[str] = parts[0:-1]
+        for p in dir_parts:
+            if len(p) == 0:
+                return None
+            if p.isidentifier() is False:
+                return None
+
+        if len(dir_parts) == 0:
+            return base
+        return ".".join([*dir_parts, base])
+
+
+    def _elf_soname_and_needed(data: bytes) -> tuple[str | None, tuple[str, ...]]:
+        """Extract ELF SONAME and DT_NEEDED entries from a shared object.
+
+        This supports 64-bit little-endian ELF files (common for manylinux x86_64/aarch64).
+
+        :param data: ELF file bytes.
+        :returns: ``(soname, needed)``.
+        """
+
+        if len(data) < 64:
+            return (None, ())
+        if data[0:4] != b"\x7fELF":
+            return (None, ())
+
+        ei_class: int = data[4]
+        ei_data: int = data[5]
+        if ei_class != 2 or ei_data != 1:
+            return (None, ())
+
+        try:
+            e_phoff: int = struct.unpack_from("<Q", data, 32)[0]
+            e_phentsize: int = struct.unpack_from("<H", data, 54)[0]
+            e_phnum: int = struct.unpack_from("<H", data, 56)[0]
+        except struct.error:
+            return (None, ())
+
+        load_segs: list[tuple[int, int, int]] = []
+        dyn_off: int | None = None
+        dyn_size: int | None = None
+
+        i: int = 0
+        while i < e_phnum:
+            ph_base: int = e_phoff + i * e_phentsize
+            try:
+                p_type: int = struct.unpack_from("<I", data, ph_base)[0]
+            except struct.error:
+                break
+
+            if p_type == 1 or p_type == 2:
+                try:
+                    p_offset: int = struct.unpack_from("<Q", data, ph_base + 8)[0]
+                    p_vaddr: int = struct.unpack_from("<Q", data, ph_base + 16)[0]
+                    p_filesz: int = struct.unpack_from("<Q", data, ph_base + 32)[0]
+                except struct.error:
+                    break
+
+                if p_type == 1:
+                    load_segs.append((p_vaddr, p_filesz, p_offset))
+                else:
+                    dyn_off = p_offset
+                    dyn_size = p_filesz
+
+            i += 1
+
+        if dyn_off is None or dyn_size is None:
+            return (None, ())
+
+        dt_strtab: int | None = None
+        dt_strsz: int | None = None
+        dt_soname_off: int | None = None
+        needed_offs: list[int] = []
+
+        dyn_end: int = dyn_off + dyn_size
+        pos: int = dyn_off
+        while pos + 16 <= dyn_end:
+            try:
+                d_tag: int = struct.unpack_from("<q", data, pos)[0]
+                d_val: int = struct.unpack_from("<Q", data, pos + 8)[0]
+            except struct.error:
+                break
+
+            if d_tag == 0:
+                break
+            if d_tag == 1:
+                needed_offs.append(int(d_val))
+            elif d_tag == 5:
+                dt_strtab = int(d_val)
+            elif d_tag == 10:
+                dt_strsz = int(d_val)
+            elif d_tag == 14:
+                dt_soname_off = int(d_val)
+
+            pos += 16
+
+        if dt_strtab is None or dt_strsz is None:
+            return (None, ())
+
+        strtab_off: int | None = None
+        for vaddr, filesz, off0 in load_segs:
+            if dt_strtab >= vaddr and dt_strtab < vaddr + filesz:
+                strtab_off = off0 + (dt_strtab - vaddr)
+                break
+
+        if strtab_off is None:
+            return (None, ())
+        if strtab_off < 0:
+            return (None, ())
+
+        strtab_end: int = strtab_off + dt_strsz
+        if strtab_end > len(data):
+            strtab_end = len(data)
+        strtab: bytes = data[strtab_off:strtab_end]
+
+        def read_cstr(off: int) -> str:
+            if off < 0 or off >= len(strtab):
+                return ""
+            end: int = strtab.find(b"\x00", off)
+            if end < 0:
+                end = len(strtab)
+            try:
+                return strtab[off:end].decode("utf-8")
+            except UnicodeDecodeError:
+                return strtab[off:end].decode("utf-8", errors="replace")
+
+        soname: str | None = None
+        if dt_soname_off is not None:
+            s: str = read_cstr(dt_soname_off)
+            if len(s) > 0:
+                soname = s
+
+        needed: list[str] = []
+        for off_needed in needed_offs:
+            s2: str = read_cstr(off_needed)
+            if len(s2) > 0:
+                needed.append(s2)
+
+        return (soname, tuple(needed))
+
+
+    def _collect_shared_objects_from_deps_zip(*, deps_zip_path: str) -> list[_SoInfo]:
+        """Collect shared object metadata from a deps-layer zip.
+
+        :param deps_zip_path: Path to the deps-layer zip (via memfd).
+        :returns: Shared object metadata list.
+        """
+
+        infos: list[_SoInfo] = []
+        with zipfile.ZipFile(deps_zip_path, mode="r") as zf:
+            for zi in zf.infolist():
+                if zi.is_dir() is True:
+                    continue
+                member: str = zi.filename
+                if _is_shared_object_member(member) is False:
+                    continue
+
+                data: bytes = zf.read(member)
+                base_name: str = pathlib.PurePosixPath(member).name
+                fd: int = _memfd_from_bytes(name=base_name[0:60], data=data)
+                fd_path: str = _proc_fd_path(fd)
+
+                soname_raw: str | None
+                needed: tuple[str, ...]
+                soname_raw, needed = _elf_soname_and_needed(data)
+                soname: str = soname_raw if soname_raw is not None else base_name
+                module_name: str | None = _extension_module_name_from_member(member)
+
+                infos.append(
+                    _SoInfo(
+                        member=member,
+                        fd_path=fd_path,
+                        soname=soname,
+                        needed=needed,
+                        module_name=module_name,
+                    )
+                )
+
+        return infos
+
+
+    def _topo_sort_shared_objects(infos: list[_SoInfo]) -> list[_SoInfo]:
+        """Topologically sort shared objects by DT_NEEDED dependencies.
+
+        :param infos: Shared object infos.
+        :returns: Sorted list (best-effort).
+        """
+
+        index_by_soname: dict[str, int] = {}
+        i: int = 0
+        while i < len(infos):
+            so: _SoInfo = infos[i]
+            if so.soname not in index_by_soname:
+                index_by_soname[so.soname] = i
+            i += 1
+
+        indegree: list[int] = [0 for _ in infos]
+        edges: dict[int, set[int]] = {}
+        for j, so2 in enumerate(infos):
+            for needed in so2.needed:
+                dep_idx: int | None = index_by_soname.get(needed)
+                if dep_idx is None:
+                    continue
+                if dep_idx == j:
+                    continue
+                if dep_idx not in edges:
+                    edges[dep_idx] = set()
+                if j not in edges[dep_idx]:
+                    edges[dep_idx].add(j)
+                    indegree[j] += 1
+
+        ready: list[int] = [k for k, d in enumerate(indegree) if d == 0]
+        ready.sort(key=lambda idx: infos[idx].soname)
+        order: list[int] = []
+        while len(ready) > 0:
+            idx0: int = ready.pop(0)
+            order.append(idx0)
+
+            nexts: set[int] = edges.get(idx0, set())
+            for dep in sorted(nexts, key=lambda x: infos[x].soname):
+                indegree[dep] -= 1
+                if indegree[dep] == 0:
+                    ready.append(dep)
+                    ready.sort(key=lambda x: infos[x].soname)
+
+        if len(order) != len(infos):
+            seen: set[int] = set(order)
+            remaining: list[int] = [k for k in range(len(infos)) if k not in seen]
+            remaining.sort(key=lambda x: infos[x].soname)
+            order.extend(remaining)
+
+        return [infos[k] for k in order]
+
+
+    def _preload_shared_objects(infos: list[_SoInfo]) -> None:
+        """Pre-load shared objects into the process.
+
+        This helps resolve wheels that rely on ``$ORIGIN`` RPATHs, by ensuring needed
+        libraries are already loaded globally before extension modules import.
+
+        :param infos: Shared object infos.
+        """
+
+        if len(infos) == 0:
+            return
+
+        rtld_global: int = os.RTLD_GLOBAL if hasattr(os, "RTLD_GLOBAL") is True else 0
+        rtld_now: int = os.RTLD_NOW if hasattr(os, "RTLD_NOW") is True else 0
+        sys.setdlopenflags(sys.getdlopenflags() | rtld_global)
+
+        ordered: list[_SoInfo] = _topo_sort_shared_objects(infos)
+        pending: list[_SoInfo] = ordered
+        max_passes: int = 8
+        pass_idx: int = 0
+
+        while pass_idx < max_passes and len(pending) > 0:
+            next_pending: list[_SoInfo] = []
+            loaded_count: int = 0
+            for so in pending:
+                try:
+                    h = ctypes.CDLL(so.fd_path, mode=rtld_global | rtld_now)
+                except OSError:
+                    next_pending.append(so)
+                    continue
+                _MEM_LIB_HANDLES.append(h)
+                loaded_count += 1
+
+            pending = next_pending
+            if loaded_count == 0:
+                break
+            pass_idx += 1
+
+        if len(pending) > 0:
+            lines: list[str] = ["In-memory runtime failed to preload some shared libraries:"]
+            for so in pending[0:10]:
+                lines.append(f"- {so.member}")
+            if len(pending) > 10:
+                lines.append(f"... and {len(pending) - 10} more")
+            _runtime_error("\n".join(lines) + "\n")
+
+
+    class _MemExtensionFinder(importlib.abc.MetaPathFinder):
+        """Meta path finder for extension modules stored in memfd."""
+
+        _module_paths: dict[str, str]
+
+        def __init__(self, module_paths: dict[str, str]) -> None:
+            """Initialize the finder.
+
+            :param module_paths: Mapping from dotted module name to memfd path.
+            """
+
+            self._module_paths = module_paths
+
+        def find_spec(  # type: ignore[override]
+            self,
+            fullname: str,
+            path: object | None,
+            target: object | None = None,
+        ) -> importlib.machinery.ModuleSpec | None:
+            """Find an extension module spec by name.
+
+            :param fullname: Module name being imported.
+            :param path: Package path hint (unused).
+            :param target: Target module (unused).
+            :returns: A module spec if this is a bundled extension module.
+            """
+
+            origin: str | None = self._module_paths.get(fullname)
+            if origin is None:
+                return None
+
+            loader = importlib.machinery.ExtensionFileLoader(fullname, origin)
+            return importlib.util.spec_from_file_location(fullname, origin, loader=loader)
+
+
+    def _install_extension_finder(*, module_paths: dict[str, str]) -> None:
+        """Install the in-memory extension module finder.
+
+        :param module_paths: Mapping of module name to memfd path.
+        """
+
+        if len(module_paths) == 0:
+            return
+        sys.meta_path.insert(0, _MemExtensionFinder(module_paths))
+
+
+    def _is_valid_pkg_segment(segment: str) -> bool:
+        """Return whether a path segment can be used as a package name.
+
+        :param segment: Path segment.
+        :returns: ``True`` if it can be used as a Python package name.
+        """
+
+        if len(segment) == 0:
+            return False
+        if segment == "__pycache__":
+            return False
+        return segment.isidentifier()
+
+
+    def _discover_namespace_packages_in_zip(
+        *, zip_path: str, root_prefix: str, base_path: str
+    ) -> dict[str, list[str]]:
+        """Discover namespace packages in a zip payload.
+
+        Python supports namespace packages (PEP 420) for directories on ``sys.path``
+        without an ``__init__.py``. When running from zip paths, the default import
+        machinery may fail to recognize namespace packages like ``google``.
+
+        :param zip_path: Zip file path (via memfd).
+        :param root_prefix: Member prefix that acts as the import root (e.g. ``"app/"``).
+        :param base_path: ``sys.path`` entry corresponding to ``root_prefix``.
+        :returns: Mapping of namespace fullname to submodule search locations.
+        """
+
+        init_dirs: set[str] = set()
+        module_fullnames: set[str] = set()
+        candidate_dirs: set[str] = set()
+
+        with zipfile.ZipFile(zip_path, mode="r") as zf:
+            for zi in zf.infolist():
+                if zi.is_dir() is True:
+                    continue
+
+                member: str = zi.filename
+                rel: str
+                if len(root_prefix) > 0:
+                    if member.startswith(root_prefix) is False:
+                        continue
+                    rel = member[len(root_prefix) :]
+                else:
+                    rel = member
+
+                if len(rel) == 0:
+                    continue
+
+                parts: list[str] = rel.split("/")
+                if len(parts) == 0:
+                    continue
+
+                filename: str = parts[-1]
+                dir_parts: list[str] = parts[0:-1]
+
+                acc: list[str] = []
+                for p in dir_parts:
+                    acc.append(p)
+                    candidate_dirs.add("/".join(acc))
+
+                if filename == "__init__.py":
+                    init_dirs.add("/".join(dir_parts))
+                    continue
+
+                # Track "real" modules so the namespace finder does not mask them.
+                if filename.endswith(".py") is True:
+                    base: str = filename[0:-3]
+                    if base == "__init__":
+                        continue
+                    if base.isidentifier() is False:
+                        continue
+
+                    ok_dirs: bool = True
+                    for d in dir_parts:
+                        if _is_valid_pkg_segment(d) is False:
+                            ok_dirs = False
+                            break
+                    if ok_dirs is False:
+                        continue
+
+                    fullname: str
+                    if len(dir_parts) == 0:
+                        fullname = base
+                    else:
+                        fullname = ".".join([*dir_parts, base])
+                    module_fullnames.add(fullname)
+                    continue
+
+                if _is_shared_object_member(rel) is True:
+                    ext_name: str | None = _extension_module_name_from_member(rel)
+                    if ext_name is not None:
+                        module_fullnames.add(ext_name)
+
+        ns_paths: dict[str, list[str]] = {}
+        for dir_path in sorted(candidate_dirs):
+            if dir_path in init_dirs:
+                continue
+
+            segs: list[str] = dir_path.split("/")
+            ok: bool = True
+            for seg in segs:
+                if _is_valid_pkg_segment(seg) is False:
+                    ok = False
+                    break
+            if ok is False:
+                continue
+
+            fullname2: str = ".".join(segs)
+            if fullname2 in module_fullnames:
+                continue
+
+            ns_paths[fullname2] = [f"{base_path}/{dir_path}"]
+
+        return ns_paths
+
+
+    def _merge_namespace_paths(
+        *, base: dict[str, list[str]], extra: dict[str, list[str]]
+    ) -> dict[str, list[str]]:
+        """Merge two namespace package mappings.
+
+        :param base: Base mapping (modified in-place).
+        :param extra: Extra mapping to merge in.
+        :returns: The merged mapping.
+        """
+
+        for fullname, locations in extra.items():
+            if fullname in base:
+                dest: list[str] = base[fullname]
+                for loc in locations:
+                    if loc not in dest:
+                        dest.append(loc)
+                continue
+
+            base[fullname] = list(locations)
+
+        return base
+
+
+    class _MemNamespaceFinder(importlib.abc.MetaPathFinder):
+        """Meta path finder for namespace packages inside in-memory zip paths."""
+
+        _ns_paths: dict[str, list[str]]
+
+        def __init__(self, ns_paths: dict[str, list[str]]) -> None:
+            """Initialize the finder.
+
+            :param ns_paths: Mapping from namespace fullname to search locations.
+            """
+
+            self._ns_paths = ns_paths
+
+        def find_spec(  # type: ignore[override]
+            self,
+            fullname: str,
+            path: object | None,
+            target: object | None = None,
+        ) -> importlib.machinery.ModuleSpec | None:
+            """Find a namespace package spec by name.
+
+            :param fullname: Module name being imported.
+            :param path: Package path hint (unused).
+            :param target: Target module (unused).
+            :returns: A module spec if this is a bundled namespace package.
+            """
+
+            locations: list[str] | None = self._ns_paths.get(fullname)
+            if locations is None:
+                return None
+
+            spec = importlib.machinery.ModuleSpec(fullname, loader=None, is_package=True)
+            spec.submodule_search_locations = list(locations)
+            return spec
+
+
+    def _install_namespace_finder(*, ns_paths: dict[str, list[str]]) -> None:
+        """Install the in-memory namespace package finder.
+
+        :param ns_paths: Mapping from namespace fullname to search locations.
+        """
+
+        if len(ns_paths) == 0:
+            return
+        sys.meta_path.insert(0, _MemNamespaceFinder(ns_paths))
+
+
+    def _patch_open_for_zip_paths(*, payload_zip_path: str, deps_zip_path: str | None) -> None:
+        """Patch ``open()`` so zip-internal pseudo-paths can be read without extraction.
+
+        Some third-party packages incorrectly do ``open(str(importlib.resources.files(...)))``.
+        When running from a zip path, that string is not a real filesystem path. This hook
+        intercepts such reads and serves the bytes from the bundled zip payloads.
+
+        :param payload_zip_path: Path to the outer bundle zip (via memfd).
+        :param deps_zip_path: Optional path to the deps-layer zip (via memfd).
+        """
+
+        global _OPEN_PATCHED
+        if _OPEN_PATCHED is True:
+            return
+
+        zip_cache: dict[str, zipfile.ZipFile] = {}
+
+        def read_member(zip_path: str, member: str) -> bytes:
+            zf: zipfile.ZipFile | None = zip_cache.get(zip_path)
+            if zf is None:
+                zf = zipfile.ZipFile(zip_path, mode="r")
+                zip_cache[zip_path] = zf
+            return zf.read(member)
+
+        payload_prefix: str = payload_zip_path + "/"
+        deps_prefix: str | None = None
+        if deps_zip_path is not None:
+            deps_prefix = deps_zip_path + "/"
+
+        def open_compat(  # type: ignore[override]
+            file: object,
+            mode: str = "r",
+            buffering: int = -1,
+            encoding: str | None = None,
+            errors: str | None = None,
+            newline: str | None = None,
+            closefd: bool = True,
+            opener: object | None = None,
+        ) -> io.IOBase:
+            """Open a file path, with support for bundled zip pseudo-paths.
+
+            :param file: File path or file descriptor.
+            :param mode: Open mode.
+            :returns: An IO object.
+            """
+
+            write_like: bool = False
+            for ch in ("w", "a", "x", "+"):
+                if ch in mode:
+                    write_like = True
+                    break
+            if write_like is True:
+                return _ORIG_OPEN(file, mode, buffering, encoding, errors, newline, closefd, opener)  # type: ignore[return-value]
+
+            try:
+                path0 = os.fspath(file)
+            except TypeError:
+                return _ORIG_OPEN(file, mode, buffering, encoding, errors, newline, closefd, opener)  # type: ignore[return-value]
+
+            if isinstance(path0, str) is False:
+                return _ORIG_OPEN(file, mode, buffering, encoding, errors, newline, closefd, opener)  # type: ignore[return-value]
+
+            data: bytes | None = None
+            if path0.startswith(payload_prefix) is True:
+                member0: str = path0[len(payload_prefix) :]
+                try:
+                    data = read_member(payload_zip_path, member0)
+                except KeyError:
+                    data = None
+            elif deps_prefix is not None and path0.startswith(deps_prefix) is True:
+                member1: str = path0[len(deps_prefix) :]
+                try:
+                    data = read_member(deps_zip_path, member1)  # type: ignore[arg-type]
+                except KeyError:
+                    data = None
+
+            if data is None:
+                return _ORIG_OPEN(file, mode, buffering, encoding, errors, newline, closefd, opener)  # type: ignore[return-value]
+
+            bio = io.BytesIO(data)
+            if "b" in mode:
+                return bio
+
+            enc: str = encoding if encoding is not None else "utf-8"
+            err: str = errors if errors is not None else "strict"
+            return io.TextIOWrapper(bio, encoding=enc, errors=err, newline=newline)
+
+        builtins.open = open_compat  # type: ignore[assignment]
+        _OPEN_PATCHED = True
+
+
+    class _MemfdResourceFile:
+        """Context manager that exposes a zip resource as a memfd-backed ``Path``."""
+
+        _traversable: zipfile.Path
+        _fd: int | None
+
+        def __init__(self, traversable: zipfile.Path) -> None:
+            """Initialize the context manager.
+
+            :param traversable: Zipfile traversable for a single file.
+            """
+
+            self._traversable = traversable
+            self._fd = None
+
+        def __enter__(self) -> pathlib.Path:
+            """Enter the context manager.
+
+            :returns: A real filesystem path (via ``/proc/self/fd/<fd>``).
+            """
+
+            if self._traversable.is_dir() is True:
+                _runtime_error("In-memory mode does not support importlib.resources.as_file() for directories.\n")
+
+            data: bytes = self._traversable.read_bytes()
+            fd: int = _memfd_from_bytes(name="pyflat_resource", data=data)
+            self._fd = fd
+            return pathlib.Path(_proc_fd_path(fd))
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            """Exit the context manager.
+
+            :param exc_type: Exception type (unused).
+            :param exc: Exception instance (unused).
+            :param tb: Traceback (unused).
+            :returns: ``False`` to propagate exceptions.
+            """
+
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
+            return False
+
+
+    def _patch_importlib_resources_for_memfd() -> None:
+        """Patch ``importlib.resources.as_file`` to avoid temp files in in-memory mode."""
+
+        global _RESOURCES_PATCHED
+        if _RESOURCES_PATCHED is True:
+            return
+
+        def as_file_compat(traversable: object) -> object:
+            if isinstance(traversable, zipfile.Path) is True:
+                return _MemfdResourceFile(traversable)
+            return _ORIG_IMPORTLIB_AS_FILE(traversable)
+
+        importlib.resources.as_file = as_file_compat  # type: ignore[assignment]
+        _RESOURCES_PATCHED = True
+
+
+    def _configure_sys_path_in_memory(*, payload_zip_path: str, deps_zip_path: str | None) -> None:
+        """Configure ``sys.path`` for the in-memory runtime mode.
+
+        :param payload_zip_path: Path to the outer bundle zip (via memfd).
+        :param deps_zip_path: Optional path to the deps-layer zip (via memfd).
+        """
+
+        app_path: str = f"{payload_zip_path}/app"
+        if app_path in sys.path:
+            sys.path.remove(app_path)
+        sys.path.insert(0, app_path)
+
+        if deps_zip_path is None:
+            return
+
+        if deps_zip_path in sys.path:
+            sys.path.remove(deps_zip_path)
+        sys.path.insert(1, deps_zip_path)
+
+
+    def _ensure_in_memory_setup() -> tuple[str, str | None]:
+        """Initialize the in-memory runtime mode if needed.
+
+        :returns: ``(payload_zip_path, deps_zip_path)``.
+        """
+
+        global _MEM_SETUP_DONE
+        global _MEM_PAYLOAD_ZIP_PATH
+        global _MEM_DEPS_ZIP_PATH
+        global _MEM_EXTENSION_MODULE_PATHS
+
+        if _MEM_SETUP_DONE is True:
+            if _MEM_PAYLOAD_ZIP_PATH is None:
+                _runtime_error("Internal error: in-memory setup marked done but payload missing.\n")
+            return (_MEM_PAYLOAD_ZIP_PATH, _MEM_DEPS_ZIP_PATH)
+
+        sys.dont_write_bytecode = True
+
+        zip_bytes: bytes = _bundle_zip_bytes()
+        payload_fd: int = _memfd_from_bytes(name="pyflat_bundle", data=zip_bytes)
+        payload_zip_path: str = _proc_fd_path(payload_fd)
+        _MEM_PAYLOAD_ZIP_PATH = payload_zip_path
+
+        deps_zip_path: str | None = None
+        try:
+            with zipfile.ZipFile(payload_zip_path, mode="r") as zf:
+                deps_bytes: bytes = zf.read("deps_layer.zip")
+        except KeyError:
+            deps_bytes = b""
+
+        if len(deps_bytes) > 0:
+            deps_fd: int = _memfd_from_bytes(name="pyflat_deps", data=deps_bytes)
+            deps_zip_path = _proc_fd_path(deps_fd)
+            _MEM_DEPS_ZIP_PATH = deps_zip_path
+
+            infos: list[_SoInfo] = _collect_shared_objects_from_deps_zip(deps_zip_path=deps_zip_path)
+            module_paths: dict[str, str] = {}
+            for so in infos:
+                if so.module_name is not None:
+                    module_paths[so.module_name] = so.fd_path
+            _MEM_EXTENSION_MODULE_PATHS = module_paths
+
+            _preload_shared_objects(infos)
+            _install_extension_finder(module_paths=module_paths)
+
+        ns_paths: dict[str, list[str]] = {}
+        app_path: str = f"{payload_zip_path}/app"
+        app_ns: dict[str, list[str]] = _discover_namespace_packages_in_zip(
+            zip_path=payload_zip_path,
+            root_prefix="app/",
+            base_path=app_path,
+        )
+        _merge_namespace_paths(base=ns_paths, extra=app_ns)
+
+        if deps_zip_path is not None:
+            deps_ns: dict[str, list[str]] = _discover_namespace_packages_in_zip(
+                zip_path=deps_zip_path,
+                root_prefix="",
+                base_path=deps_zip_path,
+            )
+            _merge_namespace_paths(base=ns_paths, extra=deps_ns)
+
+        _install_namespace_finder(ns_paths=ns_paths)
+
+        _configure_sys_path_in_memory(payload_zip_path=payload_zip_path, deps_zip_path=deps_zip_path)
+        _patch_open_for_zip_paths(payload_zip_path=payload_zip_path, deps_zip_path=deps_zip_path)
+        _patch_importlib_resources_for_memfd()
+        _MEM_SETUP_DONE = True
+        return (payload_zip_path, deps_zip_path)
+
+
+    def _read_zip_member(*, zip_path: str, member: str) -> bytes:
+        """Read a member from a zip file at ``zip_path``.
+
+        :param zip_path: Zip path (via memfd).
+        :param member: Member name to read.
+        :returns: Member bytes.
+        """
+
+        with zipfile.ZipFile(zip_path, mode="r") as zf:
+            try:
+                return zf.read(member)
+            except KeyError:
+                _runtime_error(f"Missing bundled file: {member!r}\n")
+                raise AssertionError("unreachable")
+
+
+    def _try_resolve_module_source_in_memory(
+        *, payload_zip_path: str, module_name: str
+    ) -> tuple[str, bool, str | None] | None:
+        """Resolve a module name into a source file inside the bundled app.
+
+        :param payload_zip_path: Path to the outer bundle zip (via memfd).
+        :param module_name: Dotted module name.
+        :returns: ``(source_member, is_package, package_dir_member)`` or ``None``.
+        """
+
+        parts: list[str] = module_name.split(".")
+        pkg_member: str = "app/" + "/".join(parts) + "/__init__.py"
+        mod_member: str = "app/" + "/".join(parts) + ".py"
+
+        with zipfile.ZipFile(payload_zip_path, mode="r") as zf:
+            try:
+                zf.getinfo(pkg_member)
+                pkg_dir_member: str = "app/" + "/".join(parts)
+                return (pkg_member, True, pkg_dir_member)
+            except KeyError:
+                pass
+
+            try:
+                zf.getinfo(mod_member)
+                return (mod_member, False, None)
+            except KeyError:
+                return None
+
+
+    def _resolve_import_source_in_memory(
+        *, payload_zip_path: str
+    ) -> tuple[str, bool, str | None]:
+        """Pick a source file to load into this module when imported (in-memory mode).
+
+        :param payload_zip_path: Path to the outer bundle zip (via memfd).
+        :returns: ``(source_member, is_package, package_dir_member)``.
+        """
+
+        resolved_self = _try_resolve_module_source_in_memory(
+            payload_zip_path=payload_zip_path,
+            module_name=__name__,
+        )
+        if resolved_self is not None:
+            return resolved_self
+
+        kind: str = _ENTRY["kind"]
+        if kind == "path":
+            rel_path: str = _ENTRY["path"]
+            member: str = f"app/{rel_path}"
+            with zipfile.ZipFile(payload_zip_path, mode="r") as zf:
+                try:
+                    zf.getinfo(member)
+                except KeyError:
+                    _runtime_error(f"Entry file missing in bundle: {rel_path!r}\n")
+            return (member, False, None)
+
+        if kind == "module":
+            module_name: str = _ENTRY["module"]
+            resolved_entry = _try_resolve_module_source_in_memory(
+                payload_zip_path=payload_zip_path,
+                module_name=module_name,
+            )
+            if resolved_entry is None:
+                _runtime_error("Entry module missing in bundle.\n" f"module={module_name!r}\n")
+            return resolved_entry
+
+        _runtime_error(f"Invalid entry kind: {kind!r}\n")
+        raise AssertionError("unreachable")
+
+
+    def _exec_source_into_this_module_in_memory(
+        *,
+        payload_zip_path: str,
+        source_member: str,
+        is_package: bool,
+        package_dir_member: str | None,
+    ) -> None:
+        """Execute bundled app code into this module object (in-memory mode).
+
+        :param payload_zip_path: Path to the outer bundle zip (via memfd).
+        :param source_member: Zip member for the source file (e.g. ``app/tools.py``).
+        :param is_package: Whether this should behave like a package.
+        :param package_dir_member: Package directory member (required for packages).
+        """
+
+        if __name__ not in sys.modules:
+            _runtime_error("Internal error: importing module but missing from sys.modules.\n")
+        m = sys.modules[__name__]
+
+        file_path: str = f"{payload_zip_path}/{source_member}"
+        m.__file__ = file_path
+        if is_package is True:
+            if package_dir_member is None:
+                _runtime_error("Internal error: is_package true but package_dir_member missing.\n")
+            m.__path__ = [f"{payload_zip_path}/{package_dir_member}"]
+            m.__package__ = __name__
+        else:
+            m.__package__ = __name__.rpartition(".")[0]
+
+        src_bytes: bytes = _read_zip_member(zip_path=payload_zip_path, member=source_member)
+        try:
+            src_text: str = src_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            _runtime_error(f"Failed to decode bundled source as UTF-8: {source_member!r}\n")
+
+        code = compile(src_text, file_path, "exec")
+        exec(code, m.__dict__)
+
+
+    def _bootstrap_import_in_memory() -> None:
+        """Make importing the bundle behave like importing the original module/package (in-memory)."""
+
+        payload_zip_path: str
+        deps_zip_path: str | None
+        payload_zip_path, deps_zip_path = _ensure_in_memory_setup()
+
+        source_member: str
+        is_package: bool
+        package_dir_member: str | None
+        source_member, is_package, package_dir_member = _resolve_import_source_in_memory(
+            payload_zip_path=payload_zip_path
+        )
+        _exec_source_into_this_module_in_memory(
+            payload_zip_path=payload_zip_path,
+            source_member=source_member,
+            is_package=is_package,
+            package_dir_member=package_dir_member,
+        )
+
+
+    def _run_in_memory() -> None:
+        """Execute the app entrypoint (in-memory mode)."""
+
+        payload_zip_path: str
+        deps_zip_path: str | None
+        payload_zip_path, deps_zip_path = _ensure_in_memory_setup()
+
+        kind: str = _ENTRY["kind"]
+        if kind == "module":
+            module_name: str = _ENTRY["module"]
+            runpy.run_module(module_name, run_name="__main__", alter_sys=True)
+            return
+        if kind == "path":
+            rel_path: str = _ENTRY["path"]
+            member: str = f"app/{rel_path}"
+            src_bytes: bytes = _read_zip_member(zip_path=payload_zip_path, member=member)
+            try:
+                src_text: str = src_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                _runtime_error(f"Failed to decode bundled source as UTF-8: {member!r}\n")
+
+            file_path: str = f"{payload_zip_path}/{member}"
+            sys.argv[0] = file_path
+            g: dict[str, object] = {
+                "__name__": "__main__",
+                "__file__": file_path,
+                "__package__": "",
+                "__builtins__": __builtins__,
+            }
+            code = compile(src_text, file_path, "exec")
+            exec(code, g)
+            return
+
+        _runtime_error(f"Invalid entry kind: {kind!r}\n")
 
 
     def _normalize_arch(machine: str) -> str:
@@ -1541,6 +2649,9 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
         _BOOTSTRAPPED_IMPORT = True
 
         _check_runtime_compat()
+        if _use_in_memory_runtime() is True:
+            _bootstrap_import_in_memory()
+            return
         root: pathlib.Path = _ensure_extracted()
         app_dir: pathlib.Path = root / "app"
         deps_dir: pathlib.Path = _ensure_deps_ready(root=root)
@@ -1561,6 +2672,9 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
         """Program entrypoint."""
 
         _check_runtime_compat()
+        if _use_in_memory_runtime() is True:
+            _run_in_memory()
+            return
         root: pathlib.Path = _ensure_extracted()
         _run(entry_root=root)
 
