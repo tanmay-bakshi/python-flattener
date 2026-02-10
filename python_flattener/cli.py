@@ -1,10 +1,41 @@
 """Command line interface for python-flattener."""
 
 import argparse
+import logging
 import pathlib
+import sys
 
 from python_flattener.builder import build_single_file
 from python_flattener.target import TargetConfig, resolve_target_config
+
+
+def _configure_logging(*, verbose: int, quiet: int) -> logging.Logger:
+    """Configure the python-flattener logger.
+
+    :param verbose: Verbosity count (0+).
+    :param quiet: Quietness count (0+).
+    :returns: Configured logger.
+    """
+
+    level: int = logging.INFO
+    if quiet >= 2:
+        level = logging.ERROR
+    elif quiet >= 1:
+        level = logging.WARNING
+    elif verbose >= 1:
+        level = logging.DEBUG
+
+    logger: logging.Logger = logging.getLogger("python_flattener")
+    logger.setLevel(level)
+    logger.propagate = False
+
+    handler: logging.Handler = logging.StreamHandler(stream=sys.stderr)
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    return logger
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -96,9 +127,24 @@ def main(argv: list[str] | None = None) -> int:
             "Useful for packages with relative imports."
         ),
     )
+    p_build.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Enable verbose logging. Pass multiple times for more detail.",
+    )
+    p_build.add_argument(
+        "-q",
+        "--quiet",
+        action="count",
+        default=0,
+        help="Reduce logging. Pass multiple times to suppress more output.",
+    )
 
     ns = parser.parse_args(argv)
     if ns.command == "build":
+        logger: logging.Logger = _configure_logging(verbose=ns.verbose, quiet=ns.quiet)
         target_cfg: TargetConfig = resolve_target_config(
             target=ns.target,
             platform_tag_override=ns.platform_tag,
@@ -114,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
             target=target_cfg,
             entry_relpath=ns.entry,
             entry_module=ns.module,
+            logger=logger,
         )
         return 0
 

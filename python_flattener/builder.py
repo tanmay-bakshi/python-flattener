@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import base64
 import hashlib
 import io
+import logging
 import os
 import pathlib
 import shutil
@@ -21,6 +22,7 @@ import sys
 import sysconfig
 import tempfile
 import textwrap
+import time
 import zipfile
 
 from python_flattener.target import TargetConfig
@@ -54,6 +56,18 @@ class AppLayout:
 
     app_dir: pathlib.Path
     entry: EntryPoint
+
+
+@dataclass(frozen=True, slots=True)
+class CopyStats:
+    """Stats collected while copying a directory tree.
+
+    :ivar files_copied: Number of files copied.
+    :ivar bytes_copied: Total bytes copied (best-effort).
+    """
+
+    files_copied: int
+    bytes_copied: int
 
 
 def _validate_compresslevel(compresslevel: int) -> None:
@@ -151,12 +165,14 @@ def _ensure_wheelhouse(
     requirements_path: pathlib.Path,
     cache_root: pathlib.Path,
     target: TargetConfig,
+    logger: logging.Logger,
 ) -> list[pathlib.Path]:
     """Ensure wheels are available in the local build cache.
 
     :param requirements_path: requirements.txt file.
     :param cache_root: Cache root.
     :param target: Target config.
+    :param logger: Logger for progress output.
     :returns: Wheel file paths.
     :raises BuildError: If dependency download/build fails.
     """
@@ -166,15 +182,27 @@ def _ensure_wheelhouse(
     marker: pathlib.Path = wheelhouse_dir / ".ok"
 
     if marker.is_file() is True:
-        return sorted(wheelhouse_dir.glob("*.whl"))
+        cached: list[pathlib.Path] = sorted(wheelhouse_dir.glob("*.whl"))
+        logger.info(f"python-flattener: wheelhouse cache hit ({len(cached)} wheels)")
+        if logger.isEnabledFor(logging.DEBUG) is True:
+            logger.debug(f"python-flattener: wheelhouse_dir={wheelhouse_dir}")
+        return cached
+
+    logger.info("python-flattener: wheelhouse cache miss; downloading wheels with pip")
+    if logger.isEnabledFor(logging.DEBUG) is True:
+        logger.debug(f"python-flattener: wheelhouse_dir={wheelhouse_dir}")
 
     wheelhouse_dir.mkdir(parents=True, exist_ok=True)
+    t0: float = time.perf_counter()
     wheel_files: list[pathlib.Path] = _download_wheels(
         requirements_path=requirements_path,
         wheel_dir=wheelhouse_dir,
         target=target,
+        logger=logger,
     )
+    t1: float = time.perf_counter()
     marker.write_text("ok\n", encoding="utf-8")
+    logger.info(f"python-flattener: wheel download complete ({len(wheel_files)} wheels) in {t1 - t0:.2f}s")
     return wheel_files
 
 
@@ -209,6 +237,7 @@ def _ensure_deps_layer_zip(
     requirements_path: pathlib.Path,
     target: TargetConfig,
     compresslevel: int,
+    logger: logging.Logger,
 ) -> pathlib.Path | None:
     """Build (and cache) a deps layer zip from a set of wheels.
 
@@ -220,10 +249,12 @@ def _ensure_deps_layer_zip(
     :param requirements_path: requirements.txt file (used for cache keying).
     :param target: Target config.
     :param compresslevel: Deflate compression level.
+    :param logger: Logger for progress output.
     :returns: Path to cached deps layer zip, or ``None`` if there are no wheels.
     """
 
     if len(wheel_files) == 0:
+        logger.info("python-flattener: deps layer skipped (no wheels)")
         return None
 
     req_hash: str = _sha256_file(requirements_path)
@@ -232,19 +263,35 @@ def _ensure_deps_layer_zip(
     marker: pathlib.Path = layer_dir / ".ok"
 
     if marker.is_file() is True and zip_path.is_file() is True:
+        zip_size: int = zip_path.stat().st_size
+        logger.info(
+            f"python-flattener: deps layer cache hit ({zip_size / (1024 * 1024):.1f} MiB)"
+        )
+        if logger.isEnabledFor(logging.DEBUG) is True:
+            logger.debug(f"python-flattener: deps_layer_zip={zip_path}")
         return zip_path
+
+    logger.info(f"python-flattener: deps layer cache miss; building from {len(wheel_files)} wheels")
+    if logger.isEnabledFor(logging.DEBUG) is True:
+        logger.debug(f"python-flattener: deps_layer_dir={layer_dir}")
 
     layer_dir.mkdir(parents=True, exist_ok=True)
     tmp_zip: pathlib.Path = layer_dir / "deps_layer.zip.tmp"
+    t0: float = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="deps_layer_build_", dir=layer_dir) as td:
         build_root: pathlib.Path = pathlib.Path(td)
         deps_dir: pathlib.Path = build_root / "deps"
         deps_dir.mkdir(parents=True, exist_ok=True)
         _install_wheels(wheel_files=wheel_files, deps_dir=deps_dir, target=target)
         _zip_dir_to_path(root=deps_dir, out_path=tmp_zip, compresslevel=compresslevel)
+    t1: float = time.perf_counter()
 
     tmp_zip.replace(zip_path)
     marker.write_text("ok\n", encoding="utf-8")
+    zip_size2: int = zip_path.stat().st_size
+    logger.info(
+        f"python-flattener: deps layer built ({zip_size2 / (1024 * 1024):.1f} MiB) in {t1 - t0:.2f}s"
+    )
     return zip_path
 
 
@@ -295,6 +342,7 @@ def build_single_file(
     target: TargetConfig,
     entry_relpath: str | None,
     entry_module: str | None,
+    logger: logging.Logger | None = None,
     cache_dir: pathlib.Path | None = None,
     compresslevel: int = 1,
 ) -> None:
@@ -306,8 +354,12 @@ def build_single_file(
     :param target: Target interpreter/platform config for wheel resolution.
     :param entry_relpath: Optional entry file path relative to the input directory.
     :param entry_module: Optional module name to run (python -m style).
+    :param logger: Optional logger for realtime build progress output.
     :raises BuildError: If bundling fails.
     """
+
+    if logger is None:
+        logger = logging.getLogger("python_flattener")
 
     if input_path.exists() is False:
         raise BuildError(f"Input path does not exist: {input_path}")
@@ -321,6 +373,15 @@ def build_single_file(
 
     _validate_compresslevel(compresslevel)
 
+    t_total0: float = time.perf_counter()
+    logger.info(f"python-flattener: input={input_path}")
+    logger.info(f"python-flattener: requirements={requirements_path}")
+    logger.info(f"python-flattener: output={output_path}")
+    logger.info(
+        "python-flattener: target="
+        f"{target.platform_tag} py={target.python_version} impl={target.implementation} abi={target.abi}"
+    )
+
     with tempfile.TemporaryDirectory(prefix="python_flattener_build_") as td:
         build_root: pathlib.Path = pathlib.Path(td)
         staging_root: pathlib.Path = build_root / "staging"
@@ -333,19 +394,28 @@ def build_single_file(
             output_path=output_path,
             cache_dir=cache_dir,
         )
+        if logger.isEnabledFor(logging.DEBUG) is True:
+            logger.debug(f"python-flattener: staging excludes={sorted(exclude_relpaths)}")
+
+        t_stage0: float = time.perf_counter()
         app_layout: AppLayout = _stage_app(
             input_path=input_path,
             app_dir=app_dir,
             entry_relpath=entry_relpath,
             entry_module=entry_module,
             exclude_relpaths=exclude_relpaths,
+            logger=logger,
         )
+        t_stage1: float = time.perf_counter()
+        logger.info(f"python-flattener: staged app in {t_stage1 - t_stage0:.2f}s")
 
         cache_root: pathlib.Path = _resolve_cache_root(cache_dir)
+        logger.info(f"python-flattener: cache_root={cache_root}")
         wheel_files: list[pathlib.Path] = _ensure_wheelhouse(
             requirements_path=requirements_path,
             cache_root=cache_root,
             target=target,
+            logger=logger,
         )
         deps_layer_zip: pathlib.Path | None = _ensure_deps_layer_zip(
             wheel_files=wheel_files,
@@ -353,21 +423,38 @@ def build_single_file(
             requirements_path=requirements_path,
             target=target,
             compresslevel=compresslevel,
+            logger=logger,
         )
 
+        t_payload0: float = time.perf_counter()
         bundle_zip_bytes: bytes = _build_payload_zip_bytes(
             app_dir=app_dir,
             deps_layer_zip=deps_layer_zip,
             compresslevel=compresslevel,
         )
-        script_text: str = _render_single_file(
-            bundle_zip_bytes=bundle_zip_bytes,
-            entry=app_layout.entry,
-            target=target,
+        t_payload1: float = time.perf_counter()
+        logger.info(
+            f"python-flattener: payload zip built ({len(bundle_zip_bytes) / (1024 * 1024):.1f} MiB) "
+            f"in {t_payload1 - t_payload0:.2f}s"
         )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(script_text, encoding="utf-8")
+        t_write0: float = time.perf_counter()
+        _write_single_file(
+            output_path=output_path,
+            bundle_zip_bytes=bundle_zip_bytes,
+            entry=app_layout.entry,
+            target=target,
+            logger=logger,
+        )
+        t_write1: float = time.perf_counter()
+        out_size: int = output_path.stat().st_size
+        logger.info(
+            f"python-flattener: wrote {output_path} ({out_size / (1024 * 1024):.1f} MiB) in {t_write1 - t_write0:.2f}s"
+        )
+
+    t_total1: float = time.perf_counter()
+    logger.info(f"python-flattener: done in {t_total1 - t_total0:.2f}s")
 
 
 def _stage_app(
@@ -377,6 +464,7 @@ def _stage_app(
     entry_relpath: str | None,
     entry_module: str | None,
     exclude_relpaths: set[str],
+    logger: logging.Logger,
 ) -> AppLayout:
     """Copy application sources into the staging directory and resolve entrypoint.
 
@@ -384,6 +472,7 @@ def _stage_app(
     :param app_dir: Destination staging ``app/`` directory.
     :param entry_relpath: Optional entry file path relative to input directory.
     :param entry_module: Optional module name to run.
+    :param logger: Logger for progress output.
     :returns: App layout information.
     :raises BuildError: If the app cannot be staged.
     """
@@ -393,7 +482,11 @@ def _stage_app(
             raise BuildError("For file inputs, do not use --entry/--module; the file is the entry.")
 
         src_root: pathlib.Path = input_path.parent
-        _copy_tree_app(src=src_root, dst=app_dir, exclude_relpaths=exclude_relpaths)
+        logger.info(f"python-flattener: staging file input; copying from {src_root}")
+        stats: CopyStats = _copy_tree_app(src=src_root, dst=app_dir, exclude_relpaths=exclude_relpaths)
+        logger.info(
+            f"python-flattener: staged sources ({stats.files_copied} files, {stats.bytes_copied / (1024 * 1024):.1f} MiB)"
+        )
 
         rel: str = input_path.name
         return AppLayout(
@@ -410,11 +503,27 @@ def _stage_app(
     if is_package_dir is True:
         staged_root = app_dir / input_path.name
         staged_root.mkdir(parents=True, exist_ok=True)
-        _copy_tree_app(src=input_path, dst=staged_root, exclude_relpaths=exclude_relpaths)
+        logger.info(f"python-flattener: staging package dir input; copying from {input_path}")
+        stats_pkg: CopyStats = _copy_tree_app(
+            src=input_path,
+            dst=staged_root,
+            exclude_relpaths=exclude_relpaths,
+        )
+        logger.info(
+            f"python-flattener: staged sources ({stats_pkg.files_copied} files, {stats_pkg.bytes_copied / (1024 * 1024):.1f} MiB)"
+        )
         staged_entry_prefix = input_path.name
     else:
         staged_root = app_dir
-        _copy_tree_app(src=input_path, dst=staged_root, exclude_relpaths=exclude_relpaths)
+        logger.info(f"python-flattener: staging dir input; copying from {input_path}")
+        stats_dir: CopyStats = _copy_tree_app(
+            src=input_path,
+            dst=staged_root,
+            exclude_relpaths=exclude_relpaths,
+        )
+        logger.info(
+            f"python-flattener: staged sources ({stats_dir.files_copied} files, {stats_dir.bytes_copied / (1024 * 1024):.1f} MiB)"
+        )
         staged_entry_prefix = ""
 
     if entry_module is not None:
@@ -479,12 +588,13 @@ def _stage_app(
     )
 
 
-def _copy_tree_app(*, src: pathlib.Path, dst: pathlib.Path, exclude_relpaths: set[str]) -> None:
+def _copy_tree_app(*, src: pathlib.Path, dst: pathlib.Path, exclude_relpaths: set[str]) -> CopyStats:
     """Copy an app directory tree to a destination, applying a conservative ignore list.
 
     :param src: Source directory.
     :param dst: Destination directory.
     :param exclude_relpaths: Relative paths within ``src`` to exclude.
+    :returns: Copy statistics.
     """
 
     ignore_names: set[str] = {
@@ -506,33 +616,68 @@ def _copy_tree_app(*, src: pathlib.Path, dst: pathlib.Path, exclude_relpaths: se
     for relpath in sorted(exclude_relpaths):
         exclude_parts.append(pathlib.PurePosixPath(relpath).parts)
 
-    for p in src.rglob("*"):
-        rel: pathlib.Path = p.relative_to(src)
-        rel_tuple: tuple[str, ...] = rel.parts
-        excluded: bool = False
+    def is_excluded(relpath: pathlib.PurePosixPath) -> bool:
+        """Check if a relative path should be excluded.
+
+        :param relpath: Path relative to ``src`` (POSIX).
+        :returns: ``True`` if it matches an excluded prefix.
+        """
+
+        rel_tuple: tuple[str, ...] = relpath.parts
         for ex in exclude_parts:
             if len(rel_tuple) >= len(ex) and rel_tuple[0 : len(ex)] == ex:
-                excluded = True
-                break
-        if excluded is True:
+                return True
+        return False
+
+    files_copied: int = 0
+    bytes_copied: int = 0
+
+    dst.mkdir(parents=True, exist_ok=True)
+
+    for root_str, dirs, files in os.walk(src, topdown=True):
+        root_path: pathlib.Path = pathlib.Path(root_str)
+        rel_root: pathlib.Path = root_path.relative_to(src)
+        rel_root_posix: pathlib.PurePosixPath = pathlib.PurePosixPath(rel_root.as_posix())
+        at_src_root: bool = rel_root_posix.as_posix() == "."
+
+        if is_excluded(rel_root_posix) is True:
+            dirs[:] = []
             continue
 
-        parts: tuple[str, ...] = rel.parts
-        if len(parts) > 0 and parts[0] in ignore_names:
-            continue
-
-        if p.is_dir() is True:
-            (dst / rel).mkdir(parents=True, exist_ok=True)
-            continue
-
-        if p.is_file() is True:
-            if p.suffix in {".pyc", ".pyo"}:
+        keep_dirs: list[str] = []
+        for d in dirs:
+            if at_src_root is True and d in ignore_names:
                 continue
-            if p.name == ".DS_Store":
+            if is_excluded(rel_root_posix / d) is True:
                 continue
-            target_path: pathlib.Path = dst / rel
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(p, target_path)
+            keep_dirs.append(d)
+        dirs[:] = keep_dirs
+
+        out_dir: pathlib.Path = dst / rel_root
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for name in files:
+            if name == ".DS_Store":
+                continue
+            if at_src_root is True and name in ignore_names:
+                continue
+
+            src_path: pathlib.Path = root_path / name
+            if src_path.suffix in {".pyc", ".pyo"}:
+                continue
+            if is_excluded(rel_root_posix / name) is True:
+                continue
+
+            dest_path: pathlib.Path = dst / rel_root / name
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_path, dest_path)
+            files_copied += 1
+            try:
+                bytes_copied += src_path.stat().st_size
+            except OSError:
+                pass
+
+    return CopyStats(files_copied=files_copied, bytes_copied=bytes_copied)
 
 
 def _copy_tree_all(*, src: pathlib.Path, dst: pathlib.Path) -> None:
@@ -554,13 +699,18 @@ def _copy_tree_all(*, src: pathlib.Path, dst: pathlib.Path) -> None:
 
 
 def _download_wheels(
-    *, requirements_path: pathlib.Path, wheel_dir: pathlib.Path, target: TargetConfig
+    *,
+    requirements_path: pathlib.Path,
+    wheel_dir: pathlib.Path,
+    target: TargetConfig,
+    logger: logging.Logger,
 ) -> list[pathlib.Path]:
     """Download wheels (and possibly sdists) for the given requirements.
 
     :param requirements_path: requirements.txt file.
     :param wheel_dir: Directory to download artifacts into.
     :param target: Target config for pip environment emulation.
+    :param logger: Logger for progress output.
     :returns: List of wheel files to install.
     :raises BuildError: If dependencies cannot be resolved into usable wheels.
     """
@@ -602,7 +752,8 @@ def _download_wheels(
                 target.implementation,
                 "--abi",
                 target.abi,
-            ]
+            ],
+            logger=logger,
         )
     else:
         _pip(
@@ -613,7 +764,8 @@ def _download_wheels(
                 str(wheel_dir),
                 "--requirement",
                 str(requirements_path),
-            ]
+            ],
+            logger=logger,
         )
 
     wheel_files: list[pathlib.Path] = sorted(wheel_dir.glob("*.whl"))
@@ -643,7 +795,8 @@ def _download_wheels(
                 "--wheel-dir",
                 str(wheel_dir),
                 str(sdist),
-            ]
+            ],
+            logger=logger,
         )
         after: set[str] = {p.name for p in wheel_dir.glob("*.whl")}
         new_names: set[str] = after - before
@@ -768,30 +921,21 @@ def _copy_item(*, src: pathlib.Path, dst: pathlib.Path) -> None:
         return
 
 
-def _pip(args: list[str]) -> None:
+def _pip(args: list[str], *, logger: logging.Logger | None) -> None:
     """Invoke pip with the current interpreter.
 
     :param args: Arguments after ``-m pip``.
+    :param logger: Optional logger for debug output.
     :raises BuildError: If pip fails.
     """
 
     cmd: list[str] = [sys.executable, "-m", "pip", *args]
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if logger is not None and logger.isEnabledFor(logging.DEBUG) is True:
+        logger.debug(f"python-flattener: running pip: {' '.join(cmd)}")
+
+    proc = subprocess.run(cmd, check=False)
     if proc.returncode != 0:
-        out: str = proc.stdout
-        err: str = proc.stderr
-        joined: str = "\n".join(
-            [
-                "pip invocation failed:",
-                f"cmd: {' '.join(cmd)}",
-                f"exit: {proc.returncode}",
-                "stdout:",
-                out,
-                "stderr:",
-                err,
-            ]
-        )
-        raise BuildError(joined)
+        raise BuildError(f"pip invocation failed (exit={proc.returncode}): {' '.join(cmd)}")
 
 
 def _zip_dir(root: pathlib.Path) -> bytes:
@@ -811,6 +955,82 @@ def _zip_dir(root: pathlib.Path) -> bytes:
             arcname: str = str(p.relative_to(root)).replace(os.sep, "/")
             zf.write(p, arcname=arcname)
     return buf.getvalue()
+
+
+def _write_single_file(
+    *,
+    output_path: pathlib.Path,
+    bundle_zip_bytes: bytes,
+    entry: EntryPoint,
+    target: TargetConfig,
+    logger: logging.Logger,
+) -> None:
+    """Write the final self-extracting bundle script to disk.
+
+    This avoids constructing a massive in-memory string for the base64 payload.
+
+    :param output_path: Output path for the bundled .py file.
+    :param bundle_zip_bytes: Zipped payload bytes (outer payload zip).
+    :param entry: Entrypoint information.
+    :param target: Target config embedded for runtime validation.
+    :param logger: Logger for progress output.
+    :raises BuildError: If the runtime template placeholders are missing.
+    """
+
+    sha256: str = hashlib.sha256(bundle_zip_bytes).hexdigest()
+    b64_bytes: bytes = base64.b64encode(bundle_zip_bytes)
+
+    target_json: str = (
+        "{\n"
+        f'  "platform_tag": "{target.platform_tag}",\n'
+        f'  "python_version": "{target.python_version}",\n'
+        f'  "implementation": "{target.implementation}",\n'
+        f'  "abi": "{target.abi}"\n'
+        "}"
+    )
+
+    entry_json: str
+    if entry.kind == "module":
+        if entry.module is None:
+            raise BuildError("Internal error: module entry missing module name.")
+        entry_json = "{\n" f'  "kind": "module",\n' f'  "module": "{entry.module}"\n' "}"
+    else:
+        if entry.path is None:
+            raise BuildError("Internal error: path entry missing path.")
+        entry_json = "{\n" f'  "kind": "path",\n' f'  "path": "{entry.path}"\n' "}"
+
+    runtime: str = _RUNTIME_TEMPLATE
+    runtime = runtime.replace("__PYFLAT_SHA256__", sha256)
+    runtime = runtime.replace("__PYFLAT_TARGET_JSON__", target_json)
+    runtime = runtime.replace("__PYFLAT_ENTRY_JSON__", entry_json)
+
+    marker: str = "__PYFLAT_BUNDLE_B64__"
+    idx: int = runtime.find(marker)
+    if idx < 0:
+        raise BuildError("Internal error: runtime template missing __PYFLAT_BUNDLE_B64__ marker.")
+
+    prefix: str = runtime[0:idx]
+    suffix: str = runtime[idx + len(marker) :]
+
+    if logger.isEnabledFor(logging.DEBUG) is True:
+        logger.debug(
+            f"python-flattener: rendering output (payload_b64={len(b64_bytes) / (1024 * 1024):.1f} MiB)"
+        )
+
+    wrap_width: int = 88
+    with open(output_path, "wb") as f:
+        f.write(prefix.encode("utf-8"))
+        i: int = 0
+        n: int = len(b64_bytes)
+        while i < n:
+            j: int = i + wrap_width
+            if j >= n:
+                f.write(b64_bytes[i:n])
+                break
+            f.write(b64_bytes[i:j])
+            f.write(b"\n")
+            i = j
+        f.write(suffix.encode("utf-8"))
 
 
 def _render_single_file(*, bundle_zip_bytes: bytes, entry: EntryPoint, target: TargetConfig) -> str:
