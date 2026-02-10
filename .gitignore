@@ -16,6 +16,9 @@ build/
 dist/
 *.egg-info/
 
+# python-flattener cache
+.python_flattener_cache/
+
 # OS / editor noise
 .DS_Store
 .idea/
@@ -23,4 +26,3 @@ dist/
 
 # Local scratch
 .python-version
-

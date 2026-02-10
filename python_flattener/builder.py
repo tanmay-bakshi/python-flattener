@@ -56,6 +56,237 @@ class AppLayout:
     entry: EntryPoint
 
 
+def _validate_compresslevel(compresslevel: int) -> None:
+    """Validate a zip compression level.
+
+    :param compresslevel: Compression level (0-9).
+    :raises BuildError: If the level is out of range.
+    """
+
+    if compresslevel < 0 or compresslevel > 9:
+        raise BuildError(f"Invalid compresslevel={compresslevel}; expected 0-9.")
+
+
+def _resolve_cache_root(cache_dir: pathlib.Path | None) -> pathlib.Path:
+    """Resolve the build cache directory.
+
+    Defaults to ``.python_flattener_cache`` under the current working directory.
+
+    :param cache_dir: Optional cache directory override.
+    :returns: Cache root directory.
+    """
+
+    if cache_dir is not None:
+        root: pathlib.Path = cache_dir
+    else:
+        root = pathlib.Path.cwd() / ".python_flattener_cache"
+
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _compute_stage_excludes(
+    *,
+    input_path: pathlib.Path,
+    output_path: pathlib.Path,
+    cache_dir: pathlib.Path | None,
+) -> set[str]:
+    """Compute relative paths to exclude while staging app sources.
+
+    :param input_path: Input file or directory.
+    :param output_path: Output bundle path.
+    :param cache_dir: Optional cache directory.
+    :returns: Set of relative paths (POSIX-style) to exclude.
+    """
+
+    root: pathlib.Path
+    if input_path.is_dir() is True:
+        root = input_path
+    else:
+        root = input_path.parent
+
+    root_resolved: pathlib.Path = root.resolve()
+    excludes: set[str] = set()
+
+    out_resolved: pathlib.Path = output_path.resolve()
+    if out_resolved.is_relative_to(root_resolved) is True:
+        excludes.add(out_resolved.relative_to(root_resolved).as_posix())
+
+    cache_resolved: pathlib.Path = _resolve_cache_root(cache_dir).resolve()
+    if cache_resolved.is_relative_to(root_resolved) is True:
+        excludes.add(cache_resolved.relative_to(root_resolved).as_posix())
+
+    return excludes
+
+
+def _sha256_file(path: pathlib.Path) -> str:
+    """Hash a file with SHA-256.
+
+    :param path: File to hash.
+    :returns: Hex digest.
+    """
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk: bytes = f.read(1024 * 1024)
+            if len(chunk) == 0:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _target_key(target: TargetConfig) -> str:
+    """Build a stable cache key for a target config.
+
+    :param target: Target configuration.
+    :returns: A filesystem-friendly key string.
+    """
+
+    return f"{target.platform_tag}__{target.python_version}__{target.implementation}__{target.abi}"
+
+
+def _ensure_wheelhouse(
+    *,
+    requirements_path: pathlib.Path,
+    cache_root: pathlib.Path,
+    target: TargetConfig,
+) -> list[pathlib.Path]:
+    """Ensure wheels are available in the local build cache.
+
+    :param requirements_path: requirements.txt file.
+    :param cache_root: Cache root.
+    :param target: Target config.
+    :returns: Wheel file paths.
+    :raises BuildError: If dependency download/build fails.
+    """
+
+    req_hash: str = _sha256_file(requirements_path)
+    wheelhouse_dir: pathlib.Path = cache_root / "wheelhouse" / _target_key(target) / req_hash
+    marker: pathlib.Path = wheelhouse_dir / ".ok"
+
+    if marker.is_file() is True:
+        return sorted(wheelhouse_dir.glob("*.whl"))
+
+    wheelhouse_dir.mkdir(parents=True, exist_ok=True)
+    wheel_files: list[pathlib.Path] = _download_wheels(
+        requirements_path=requirements_path,
+        wheel_dir=wheelhouse_dir,
+        target=target,
+    )
+    marker.write_text("ok\n", encoding="utf-8")
+    return wheel_files
+
+
+def _zip_dir_to_path(*, root: pathlib.Path, out_path: pathlib.Path, compresslevel: int) -> None:
+    """Zip a directory tree to a zip file on disk.
+
+    :param root: Root directory to archive.
+    :param out_path: Output zip path.
+    :param compresslevel: Deflate compression level.
+    """
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(
+        out_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=compresslevel,
+    ) as zf:
+        paths: list[pathlib.Path] = []
+        for p in root.rglob("*"):
+            if p.is_file() is True:
+                paths.append(p)
+        for p in sorted(paths):
+            arcname: str = str(p.relative_to(root)).replace(os.sep, "/")
+            zf.write(p, arcname=arcname)
+
+
+def _ensure_deps_layer_zip(
+    *,
+    wheel_files: list[pathlib.Path],
+    cache_root: pathlib.Path,
+    requirements_path: pathlib.Path,
+    target: TargetConfig,
+    compresslevel: int,
+) -> pathlib.Path | None:
+    """Build (and cache) a deps layer zip from a set of wheels.
+
+    This layer is reused across builds to avoid re-extracting and re-zipping
+    dependency trees.
+
+    :param wheel_files: Wheel file paths.
+    :param cache_root: Cache root.
+    :param requirements_path: requirements.txt file (used for cache keying).
+    :param target: Target config.
+    :param compresslevel: Deflate compression level.
+    :returns: Path to cached deps layer zip, or ``None`` if there are no wheels.
+    """
+
+    if len(wheel_files) == 0:
+        return None
+
+    req_hash: str = _sha256_file(requirements_path)
+    layer_dir: pathlib.Path = cache_root / "deps_layer" / _target_key(target) / req_hash
+    zip_path: pathlib.Path = layer_dir / "deps_layer.zip"
+    marker: pathlib.Path = layer_dir / ".ok"
+
+    if marker.is_file() is True and zip_path.is_file() is True:
+        return zip_path
+
+    layer_dir.mkdir(parents=True, exist_ok=True)
+    tmp_zip: pathlib.Path = layer_dir / "deps_layer.zip.tmp"
+    with tempfile.TemporaryDirectory(prefix="deps_layer_build_", dir=layer_dir) as td:
+        build_root: pathlib.Path = pathlib.Path(td)
+        deps_dir: pathlib.Path = build_root / "deps"
+        deps_dir.mkdir(parents=True, exist_ok=True)
+        _install_wheels(wheel_files=wheel_files, deps_dir=deps_dir, target=target)
+        _zip_dir_to_path(root=deps_dir, out_path=tmp_zip, compresslevel=compresslevel)
+
+    tmp_zip.replace(zip_path)
+    marker.write_text("ok\n", encoding="utf-8")
+    return zip_path
+
+
+def _build_payload_zip_bytes(
+    *,
+    app_dir: pathlib.Path,
+    deps_layer_zip: pathlib.Path | None,
+    compresslevel: int,
+) -> bytes:
+    """Build the outer payload zip (app + deps layer) as bytes.
+
+    :param app_dir: Staged ``app/`` directory.
+    :param deps_layer_zip: Optional cached deps layer zip.
+    :param compresslevel: Deflate compression level.
+    :returns: Zip bytes.
+    """
+
+    buf: io.BytesIO = io.BytesIO()
+    with zipfile.ZipFile(
+        buf,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=compresslevel,
+    ) as zf:
+        paths: list[pathlib.Path] = []
+        for p in app_dir.rglob("*"):
+            if p.is_file() is True:
+                paths.append(p)
+        for p in sorted(paths):
+            rel: str = str(p.relative_to(app_dir)).replace(os.sep, "/")
+            zf.write(p, arcname=f"app/{rel}")
+
+        if deps_layer_zip is not None:
+            zf.write(
+                deps_layer_zip,
+                arcname="deps_layer.zip",
+                compress_type=zipfile.ZIP_STORED,
+            )
+
+    return buf.getvalue()
+
+
 def build_single_file(
     *,
     input_path: pathlib.Path,
@@ -64,6 +295,8 @@ def build_single_file(
     target: TargetConfig,
     entry_relpath: str | None,
     entry_module: str | None,
+    cache_dir: pathlib.Path | None = None,
+    compresslevel: int = 1,
 ) -> None:
     """Build a single-file bundle.
 
@@ -86,32 +319,47 @@ def build_single_file(
     if entry_relpath is not None and entry_module is not None:
         raise BuildError("Use at most one of --entry and --module.")
 
+    _validate_compresslevel(compresslevel)
+
     with tempfile.TemporaryDirectory(prefix="python_flattener_build_") as td:
         build_root: pathlib.Path = pathlib.Path(td)
-        wheel_dir: pathlib.Path = build_root / "wheels"
         staging_root: pathlib.Path = build_root / "staging"
         app_dir: pathlib.Path = staging_root / "app"
-        deps_dir: pathlib.Path = staging_root / "deps"
-        wheel_dir.mkdir(parents=True, exist_ok=True)
         staging_root.mkdir(parents=True, exist_ok=True)
         app_dir.mkdir(parents=True, exist_ok=True)
-        deps_dir.mkdir(parents=True, exist_ok=True)
 
+        exclude_relpaths: set[str] = _compute_stage_excludes(
+            input_path=input_path,
+            output_path=output_path,
+            cache_dir=cache_dir,
+        )
         app_layout: AppLayout = _stage_app(
             input_path=input_path,
             app_dir=app_dir,
             entry_relpath=entry_relpath,
             entry_module=entry_module,
+            exclude_relpaths=exclude_relpaths,
         )
 
-        wheel_files: list[pathlib.Path] = _download_wheels(
+        cache_root: pathlib.Path = _resolve_cache_root(cache_dir)
+        wheel_files: list[pathlib.Path] = _ensure_wheelhouse(
             requirements_path=requirements_path,
-            wheel_dir=wheel_dir,
+            cache_root=cache_root,
             target=target,
         )
-        _install_wheels(wheel_files=wheel_files, deps_dir=deps_dir, target=target)
+        deps_layer_zip: pathlib.Path | None = _ensure_deps_layer_zip(
+            wheel_files=wheel_files,
+            cache_root=cache_root,
+            requirements_path=requirements_path,
+            target=target,
+            compresslevel=compresslevel,
+        )
 
-        bundle_zip_bytes: bytes = _zip_dir(staging_root)
+        bundle_zip_bytes: bytes = _build_payload_zip_bytes(
+            app_dir=app_dir,
+            deps_layer_zip=deps_layer_zip,
+            compresslevel=compresslevel,
+        )
         script_text: str = _render_single_file(
             bundle_zip_bytes=bundle_zip_bytes,
             entry=app_layout.entry,
@@ -128,6 +376,7 @@ def _stage_app(
     app_dir: pathlib.Path,
     entry_relpath: str | None,
     entry_module: str | None,
+    exclude_relpaths: set[str],
 ) -> AppLayout:
     """Copy application sources into the staging directory and resolve entrypoint.
 
@@ -144,7 +393,7 @@ def _stage_app(
             raise BuildError("For file inputs, do not use --entry/--module; the file is the entry.")
 
         src_root: pathlib.Path = input_path.parent
-        _copy_tree_app(src=src_root, dst=app_dir)
+        _copy_tree_app(src=src_root, dst=app_dir, exclude_relpaths=exclude_relpaths)
 
         rel: str = input_path.name
         return AppLayout(
@@ -161,11 +410,11 @@ def _stage_app(
     if is_package_dir is True:
         staged_root = app_dir / input_path.name
         staged_root.mkdir(parents=True, exist_ok=True)
-        _copy_tree_app(src=input_path, dst=staged_root)
+        _copy_tree_app(src=input_path, dst=staged_root, exclude_relpaths=exclude_relpaths)
         staged_entry_prefix = input_path.name
     else:
         staged_root = app_dir
-        _copy_tree_app(src=input_path, dst=staged_root)
+        _copy_tree_app(src=input_path, dst=staged_root, exclude_relpaths=exclude_relpaths)
         staged_entry_prefix = ""
 
     if entry_module is not None:
@@ -230,11 +479,12 @@ def _stage_app(
     )
 
 
-def _copy_tree_app(*, src: pathlib.Path, dst: pathlib.Path) -> None:
+def _copy_tree_app(*, src: pathlib.Path, dst: pathlib.Path, exclude_relpaths: set[str]) -> None:
     """Copy an app directory tree to a destination, applying a conservative ignore list.
 
     :param src: Source directory.
     :param dst: Destination directory.
+    :param exclude_relpaths: Relative paths within ``src`` to exclude.
     """
 
     ignore_names: set[str] = {
@@ -250,9 +500,23 @@ def _copy_tree_app(*, src: pathlib.Path, dst: pathlib.Path) -> None:
         "env",
         "build",
         "dist",
+        ".python_flattener_cache",
     }
+    exclude_parts: list[tuple[str, ...]] = []
+    for relpath in sorted(exclude_relpaths):
+        exclude_parts.append(pathlib.PurePosixPath(relpath).parts)
+
     for p in src.rglob("*"):
         rel: pathlib.Path = p.relative_to(src)
+        rel_tuple: tuple[str, ...] = rel.parts
+        excluded: bool = False
+        for ex in exclude_parts:
+            if len(rel_tuple) >= len(ex) and rel_tuple[0 : len(ex)] == ex:
+                excluded = True
+                break
+        if excluded is True:
+            continue
+
         parts: tuple[str, ...] = rel.parts
         if len(parts) > 0 and parts[0] in ignore_names:
             continue
@@ -774,6 +1038,37 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
                     shutil.copyfileobj(src, dst)
 
 
+    def _safe_extract_zipfile(*, zip_path: pathlib.Path, dest_dir: pathlib.Path) -> None:
+        """Safely extract a zip file on disk into a destination directory.
+
+        :param zip_path: Zip file path.
+        :param dest_dir: Destination directory.
+        """
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path, mode="r") as zf:
+            for info in zf.infolist():
+                name: str = info.filename
+                if "\\" in name:
+                    _runtime_error(f"Refusing to extract backslash path: {name!r}")
+                if ":" in name:
+                    _runtime_error(f"Refusing to extract drive-like path: {name!r}")
+                p = pathlib.PurePosixPath(name)
+                if p.is_absolute() is True:
+                    _runtime_error(f"Refusing to extract absolute path: {name!r}")
+                if ".." in p.parts:
+                    _runtime_error(f"Refusing to extract parent-traversal path: {name!r}")
+
+                out_path: pathlib.Path = dest_dir.joinpath(*p.parts)
+                if info.is_dir() is True:
+                    out_path.mkdir(parents=True, exist_ok=True)
+                    continue
+
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info, mode="r") as src, open(out_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+
     def _ensure_extracted() -> pathlib.Path:
         """Ensure the bundle payload is extracted to disk.
 
@@ -793,6 +1088,33 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
         _safe_extract(zip_bytes=zip_bytes, dest_dir=root)
         marker.write_text("ok\n", encoding="utf-8")
         return root
+
+
+    def _ensure_deps_ready(*, root: pathlib.Path) -> pathlib.Path:
+        """Ensure the deps directory exists and is populated.
+
+        :param root: Extraction root directory.
+        :returns: deps directory path.
+        """
+
+        deps_dir: pathlib.Path = root / "deps"
+        marker: pathlib.Path = root / ".deps_ready"
+        if marker.is_file() is True and deps_dir.is_dir() is True:
+            return deps_dir
+
+        if deps_dir.is_dir() is True and marker.is_file() is False:
+            return deps_dir
+
+        layer_zip: pathlib.Path = root / "deps_layer.zip"
+        if layer_zip.is_file() is False:
+            deps_dir.mkdir(parents=True, exist_ok=True)
+            marker.write_text("ok\n", encoding="utf-8")
+            return deps_dir
+
+        deps_dir.mkdir(parents=True, exist_ok=True)
+        _safe_extract_zipfile(zip_path=layer_zip, dest_dir=deps_dir)
+        marker.write_text("ok\n", encoding="utf-8")
+        return deps_dir
 
 
     def _configure_sys_path(*, app_dir: pathlib.Path, deps_dir: pathlib.Path) -> None:
@@ -821,7 +1143,7 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
         """
 
         app_dir: pathlib.Path = entry_root / "app"
-        deps_dir: pathlib.Path = entry_root / "deps"
+        deps_dir: pathlib.Path = _ensure_deps_ready(root=entry_root)
         _configure_sys_path(app_dir=app_dir, deps_dir=deps_dir)
 
         kind: str = _ENTRY["kind"]
@@ -957,7 +1279,7 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
         _check_runtime_compat()
         root: pathlib.Path = _ensure_extracted()
         app_dir: pathlib.Path = root / "app"
-        deps_dir: pathlib.Path = root / "deps"
+        deps_dir: pathlib.Path = _ensure_deps_ready(root=root)
         _configure_sys_path(app_dir=app_dir, deps_dir=deps_dir)
 
         source_path: pathlib.Path
