@@ -1207,21 +1207,34 @@ _RUNTIME_TEMPLATE: str = textwrap.dedent(
         expected_os: str | None = None
         expected_arch: str | None = None
 
+        parts: list[str] = expected_platform.split("_")
+
         if expected_platform.startswith("macosx_") is True:
             expected_os = "darwin"
-            expected_arch = expected_platform.split("_")[-1]
+            if len(parts) >= 4:
+                expected_arch = "_".join(parts[3:])
         elif expected_platform.startswith("win_") is True:
             expected_os = "win32"
-            expected_arch = expected_platform.split("_")[-1]
+            if len(parts) >= 2:
+                expected_arch = "_".join(parts[1:])
         elif expected_platform == "win32":
             expected_os = "win32"
-        elif (
-            expected_platform.startswith("manylinux") is True
-            or expected_platform.startswith("musllinux_") is True
-            or expected_platform.startswith("linux_") is True
-        ):
+        elif expected_platform.startswith("manylinux") is True:
             expected_os = "linux"
-            expected_arch = expected_platform.split("_")[-1]
+            if len(parts) >= 1 and parts[0] == "manylinux":
+                if len(parts) >= 4:
+                    expected_arch = "_".join(parts[3:])
+            else:
+                if len(parts) >= 2:
+                    expected_arch = "_".join(parts[1:])
+        elif expected_platform.startswith("musllinux_") is True:
+            expected_os = "linux"
+            if len(parts) >= 4:
+                expected_arch = "_".join(parts[3:])
+        elif expected_platform.startswith("linux_") is True:
+            expected_os = "linux"
+            if len(parts) >= 2:
+                expected_arch = "_".join(parts[1:])
 
         if expected_os is not None:
             actual_os: str = sys.platform
